@@ -4,17 +4,31 @@ Auto-pay fetch wrapper for L402-paywalled APIs.
 When an endpoint returns 402, automatically pays the Lightning invoice
 and retries the request with the L402 authorization header.
 
+Includes macaroon caching: paid credentials are cached per endpoint URL
+so subsequent requests reuse them without triggering a new payment cycle.
+
 Direct port of the Node.js lightning-toll client/fetch.js.
 """
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import httpx
 
 from ..nwc import NwcWallet
+
+
+@dataclass
+class CachedCredential:
+    """Cached L402 credential for a paid endpoint."""
+    macaroon: str
+    preimage: str
+    expiry: float  # Unix timestamp when this credential expires
+    amount_sats: int = 0
+    payment_hash: Optional[str] = None
 
 
 @dataclass
@@ -44,6 +58,7 @@ async def auto_pay(
     body: Any = None,
     max_sats: int = 100,
     auto_retry: bool = True,
+    credential_cache: Optional[Dict[str, CachedCredential]] = None,
 ) -> TollResponse:
     """
     Fetch a URL with automatic L402 payment handling.
@@ -56,6 +71,7 @@ async def auto_pay(
         body: Request body (for POST/PUT).
         max_sats: Maximum sats to pay per request.
         auto_retry: Automatically pay and retry on 402.
+        credential_cache: Optional dict for caching paid macaroons per URL.
 
     Returns:
         TollResponse with status, headers, body, and payment info.
@@ -66,7 +82,7 @@ async def auto_pay(
     req_headers = dict(headers or {})
 
     async with httpx.AsyncClient() as client:
-        # Make the initial request
+        # Build request kwargs
         kwargs: Dict[str, Any] = {"method": method, "url": url, "headers": req_headers}
         if body is not None:
             if isinstance(body, (dict, list)):
@@ -74,6 +90,39 @@ async def auto_pay(
             else:
                 kwargs["content"] = body
 
+        # Check for cached credentials before making the request
+        if credential_cache is not None and url in credential_cache:
+            cached = credential_cache[url]
+            if cached.expiry > time.time():
+                # Use cached credentials
+                auth_header = f"L402 {cached.macaroon}:{cached.preimage}"
+                cached_headers = {**req_headers, "Authorization": auth_header}
+                kwargs["headers"] = cached_headers
+                response = await client.request(**kwargs)
+
+                # If the cached credential was accepted, return the response
+                if response.status_code != 402:
+                    try:
+                        resp_body = response.json()
+                    except Exception:
+                        resp_body = response.text
+                    return TollResponse(
+                        status_code=response.status_code,
+                        headers=dict(response.headers),
+                        body=resp_body,
+                        paid=False,  # Used cached credential, no new payment
+                        amount_sats=0,
+                        payment_hash=cached.payment_hash,
+                    )
+
+                # 402 with cached creds — credential rejected, remove from cache and fall through
+                del credential_cache[url]
+                kwargs["headers"] = req_headers
+            else:
+                # Expired — remove from cache
+                del credential_cache[url]
+
+        # Make the initial request (no cached creds or cache miss)
         response = await client.request(**kwargs)
 
         # If not 402, return as-is
@@ -138,13 +187,26 @@ async def auto_pay(
         except Exception:
             resp_body = retry_response.text
 
+        # Cache the credential for future requests
+        # Default expiry: 5 minutes (server may override via expiresAt in challenge)
+        payment_hash = challenge.get("paymentHash")
+        if credential_cache is not None and retry_response.status_code < 400:
+            expiry_secs = challenge.get("expiresAt", time.time() + 300)
+            credential_cache[url] = CachedCredential(
+                macaroon=macaroon,
+                preimage=pay_result.preimage,
+                expiry=expiry_secs,
+                amount_sats=amount_sats,
+                payment_hash=payment_hash,
+            )
+
         return TollResponse(
             status_code=retry_response.status_code,
             headers=dict(retry_response.headers),
             body=resp_body,
             paid=True,
             amount_sats=amount_sats,
-            payment_hash=challenge.get("paymentHash"),
+            payment_hash=payment_hash,
         )
 
 
@@ -190,6 +252,9 @@ class TollClient:
         self.auto_retry = auto_retry
         self.default_headers = headers or {}
 
+        # Macaroon cache: URL -> CachedCredential
+        self._credential_cache: Dict[str, CachedCredential] = {}
+
         # Track spending
         self.total_spent = 0
         self.request_count = 0
@@ -232,6 +297,7 @@ class TollClient:
             body=body,
             max_sats=effective_max,
             auto_retry=effective_retry,
+            credential_cache=self._credential_cache,
         )
 
         if result.paid:
@@ -246,7 +312,12 @@ class TollClient:
             "total_spent": self.total_spent,
             "request_count": self.request_count,
             "payment_count": self.payment_count,
+            "cached_credentials": len(self._credential_cache),
         }
+
+    def clear_cache(self) -> None:
+        """Clear all cached credentials."""
+        self._credential_cache.clear()
 
     async def close(self) -> None:
         """Close the wallet connection."""
