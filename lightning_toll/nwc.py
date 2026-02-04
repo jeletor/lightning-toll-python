@@ -148,20 +148,22 @@ class NwcWallet:
         self.config = parse_nwc_url(nwc_url)
         self._ws: Optional[websockets.client.WebSocketClientProtocol] = None
         self._connected = False
+        self._connect_lock = asyncio.Lock()
 
     async def _ensure_connected(self) -> websockets.client.WebSocketClientProtocol:
-        """Ensure we have an active WebSocket connection."""
-        if self._ws is not None and self._connected:
-            try:
-                await self._ws.ping()
-                return self._ws
-            except Exception:
-                self._connected = False
-                self._ws = None
+        """Ensure we have an active WebSocket connection (concurrency-safe)."""
+        async with self._connect_lock:
+            if self._ws is not None and self._connected:
+                try:
+                    await self._ws.ping()
+                    return self._ws
+                except Exception:
+                    self._connected = False
+                    self._ws = None
 
-        self._ws = await websockets.connect(self.config.relay_url)
-        self._connected = True
-        return self._ws
+            self._ws = await websockets.connect(self.config.relay_url)
+            self._connected = True
+            return self._ws
 
     async def _send_nwc_request(
         self,
